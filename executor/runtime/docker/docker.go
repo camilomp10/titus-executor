@@ -2028,7 +2028,7 @@ func (r *DockerRuntime) handleDockerEvent(message events.Message, statusMessageC
 	}
 	cName, err := r.getContainerNameFromDockerEvent(message)
 	if err == nil {
-		l.Infof("Processing docker event on %s container: %s", cName, action)
+		l.Debugf("Processing docker event on %s container: %s", cName, action)
 	} else {
 		l.WithError(err).WithField("message", message).Error("Error looking up the container name for the message, ignoring docker event")
 		return nonTerminalDockerEvent
@@ -2069,11 +2069,13 @@ func (r *DockerRuntime) handleDockerEvent(message events.Message, statusMessageC
 			return isTerminalDockerEvent
 		}
 	case "health_status":
-		// TODO: Update the actual health state of the container
-		// so that ContainerStatus reflects what docker knows
-		statusMessageChan <- runtimeTypes.StatusMessage{
-			Status: runtimeTypes.StatusRunning,
-			Msg:    fmt.Sprintf("%s Docker health status: %s", cName, message.Status),
+		r.convertDockerHealthUpdateToContainerStatus(cName, message.Action)
+		if strings.Contains(message.Action, "unhealthy") {
+			statusMessageChan <- runtimeTypes.StatusMessage{
+				Status: runtimeTypes.StatusFailed,
+				Msg:    fmt.Sprintf("container %s failed its healthcheck, marking task as Failed", cName),
+			}
+			return isTerminalDockerEvent
 		}
 		return nonTerminalDockerEvent
 	case "kill":
@@ -2140,6 +2142,20 @@ func (r *DockerRuntime) getContainerNameFromID(id string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("Unknown container couldn't find the container name for cid " + id)
+}
+
+func (r *DockerRuntime) convertDockerHealthUpdateToContainerStatus(cName string, m string) {
+	readyBool := messageHealthActionToBool(m)
+	for _, c := range append(r.c.ExtraUserContainers(), r.c.ExtraPlatformContainers()...) {
+		if cName == c.Name {
+			c.Status.Ready = readyBool
+		}
+	}
+}
+
+func messageHealthActionToBool(m string) bool {
+	s := strings.TrimSpace(strings.TrimPrefix(m, "health_status:"))
+	return s != "unhealthy"
 }
 
 func (r *DockerRuntime) setupEFSMounts(parentCtx context.Context, c runtimeTypes.Container, rootFile *os.File, cred *ucred) error {
