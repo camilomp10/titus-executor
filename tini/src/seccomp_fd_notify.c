@@ -32,6 +32,7 @@
 #define EPOLL_IGNORED_VAL 3
 /* For the x32 ABI, all system call numbers have bit 30 set */
 #define X32_SYSCALL_BIT 0x40000000
+#define ARRAY_SIZE(arr) sizeof(arr) / sizeof((arr)[0])
 
 #define PRINT_WARNING(...)                                                     \
 	{                                                                      \
@@ -100,6 +101,18 @@ static int seccomp(unsigned int operation, unsigned int flags, void *args)
 	return syscall(__NR_seccomp, operation, flags, args);
 }
 
+static void populate_filters(struct sock_filter *filter,
+	struct sock_filter *feature_filter, unsigned int feature_filter_size,
+	int *filter_idx) {
+	for (unsigned int i = 0;
+	     i < feature_filter_size &&
+		 *filter_idx < BPF_MAXINSNS;
+		 i++) {
+		filter[*filter_idx] = feature_filter[i];
+		*filter_idx = *filter_idx + 1;
+	}
+}
+
 /* install_notify_filter() install_notify_filter a seccomp filter that generates user-space
    notifications (SECCOMP_RET_USER_NOTIF) when the process calls mkdir(2); the
    filter allows all other system calls.
@@ -108,19 +121,20 @@ static int seccomp(unsigned int operation, unsigned int flags, void *args)
    notifications can be fetched. 
 */
 static int install_notify_filter(void) {
-	int notify_fd = -1;
+	int notify_fd = -1, filter_idx = 0;
 	struct sock_fprog prog = {0};
+	struct sock_filter filter[BPF_MAXINSNS + 1];
 	
-	struct sock_filter perf_filter[] = {
+	struct sock_filter check_filter[] = {
 		/* X86_64_CHECK_ARCH_AND_LOAD_SYSCALL_NR */
-		BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
-			 (offsetof(struct seccomp_data, arch))),
+		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, (offsetof(struct seccomp_data, arch))),
 		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 0, 2),
-		BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
-			 (offsetof(struct seccomp_data, nr))),
+		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, (offsetof(struct seccomp_data, nr))),
 		BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, X32_SYSCALL_BIT, 0, 1),
 		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+	};
 
+	struct sock_filter perf_filter[] = {
 		/* Trap perf-related syscalls */
 		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_bpf, 0, 1),
 		BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_USER_NOTIF),
@@ -141,14 +155,7 @@ static int install_notify_filter(void) {
 		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
 	};
 
-struct sock_filter net_filter[] = {
-		/* X86_64_CHECK_ARCH_AND_LOAD_SYSCALL_NR */
-		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, (offsetof(struct seccomp_data, arch))),
-		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 0, 2),
-		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, (offsetof(struct seccomp_data, nr))),
-		BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, X32_SYSCALL_BIT, 0, 1),
-		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
-
+	struct sock_filter net_filter[] = {
 		/* Trap sendto */
 		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_sendto, 0, 1),
 		BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_USER_NOTIF),
@@ -161,7 +168,18 @@ struct sock_filter net_filter[] = {
 		/* Trap connect */
 		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_connect, 0, 1),
 		BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_USER_NOTIF),
+	};
 
+	struct sock_filter traffic_steering_filter[] = {
+		/* Trap setsocktopt */
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_setsockopt, 0, 1),
+		BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_USER_NOTIF),
+		/* Trap listen */
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_listen, 0, 1),
+		BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_USER_NOTIF),
+	};
+
+	struct sock_filter allow_filter[] = {
 		/* Every other system call is allowed */
 		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
 	};
@@ -179,22 +197,29 @@ struct sock_filter net_filter[] = {
 		}
 	}
 
+	populate_filters(filter, check_filter, ARRAY_SIZE(check_filter), &filter_idx);
+
 	char *is_handle_net = getenv("TITUS_SECCOMP_AGENT_HANDLE_NET_SYSCALLS");
 	char *is_handle_perf = getenv("TITUS_SECCOMP_AGENT_HANDLE_PERF_SYSCALLS");
+	char *is_traffic_steering = getenv("TITUS_SECCOMP_AGENT_HANDLE_TRAFFIC_STEERING");
 	if (is_handle_net != NULL) {
-		prog.filter = net_filter;
-		prog.len = 
-			(unsigned short)(sizeof(net_filter) / sizeof(net_filter[0]));
+		populate_filters(filter, net_filter, ARRAY_SIZE(net_filter), &filter_idx);
 		PRINT_INFO("Networking system calls will be intercepted");
 	} else if (is_handle_perf != NULL) {
-		prog.filter = perf_filter;
-		prog.len = 
-			(unsigned short)(sizeof(perf_filter) / sizeof(perf_filter[0]));
+		populate_filters(filter, perf_filter, ARRAY_SIZE(perf_filter), &filter_idx);
 		PRINT_INFO("BPF/Perf system calls will be intercepted");
+	} else if (is_traffic_steering != NULL) {
+		populate_filters(filter, traffic_steering_filter, ARRAY_SIZE(traffic_steering_filter), &filter_idx);
+		PRINT_INFO("traffic steering system calls will be intercepted");
 	} else {
 		PRINT_INFO("No env variables set, no interception of system calls");
 		return -1;
 	}
+
+	populate_filters(filter, allow_filter, ARRAY_SIZE(allow_filter), &filter_idx);
+
+	prog.filter = filter;
+	prog.len = filter_idx;
 
 	/* Install the filter with the SECCOMP_FILTER_FLAG_NEW_LISTENER flag; as
 	   a result, seccomp() returns a notification file descriptor. */
