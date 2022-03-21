@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net"
 
 	"github.com/lib/pq"
 
@@ -26,8 +27,11 @@ import (
 // this is the maximum number of IP addresses you are allowed to assign to an interface in EC2.
 const maxAddressesPerInterface = 50
 
-// The dummy interface is used for IP addresses that are allocated
-const staticDummyInterfaceDescription = "titus-static-dummy"
+const (
+	// The dummy interface is used for IP addresses that are allocated
+	staticDummyInterfaceDescription = "titus-static-dummy"
+	staticReservationDescription    = "titus-static-address"
+)
 
 var (
 	errAllocationNotFound = status.Error(codes.NotFound, "Could not find allocation")
@@ -79,6 +83,26 @@ func (vpcService *vpcService) getStaticInterface(ctx context.Context, tx *sql.Tx
 	_, err = tx.ExecContext(ctx, "INSERT INTO static_enis(eni_id, subnet_id) VALUES ($1, $2)", eniID, subnetID)
 	if err != nil {
 		err = errors.Wrap(err, "Unable to save newly statically created ENI")
+		span.SetStatus(traceStatusFromError(err))
+		return nil, err
+	}
+
+	return createNetworkInterfaceOutput.NetworkInterface, nil
+}
+
+func getDummyStaticInterface(ctx context.Context, session *ec2wrapper.EC2Session, subnetID string) (*ec2.NetworkInterface, error) {
+	ctx, span := trace.StartSpan(ctx, "getDummyStaticInterface")
+	defer span.End()
+
+	createNetworkInterfaceInput := ec2.CreateNetworkInterfaceInput{
+		Description:      aws.String(staticDummyInterfaceDescription),
+		SubnetId:         aws.String(subnetID),
+		Ipv6AddressCount: aws.Int64(1),
+	}
+
+	createNetworkInterfaceOutput, err := session.CreateNetworkInterface(ctx, createNetworkInterfaceInput)
+	if err != nil {
+		err = fmt.Errorf("Cannot create dummy static network interface")
 		span.SetStatus(traceStatusFromError(err))
 		return nil, err
 	}
@@ -411,4 +435,175 @@ func (vpcService *vpcService) ValidateAllocation(ctx context.Context, req *titus
 	}
 
 	return &titus.ValidationResponse{}, nil
+}
+
+type allocation struct {
+	id      string
+	region  string
+	account string
+	subnet  string
+}
+
+func FixOldAllocations(ctx context.Context, db *sql.DB, ec2 *ec2wrapper.EC2SessionManager) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{
+		ReadOnly: true,
+	})
+	if err != nil {
+		return errors.Wrap(err, "Could not start database transaction")
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	rows, err := tx.QueryContext(ctx,
+		`SELECT
+       ip_addresses.id, ip_addresses.region, subnets.account_id, ip_addresses.subnet_id
+FROM ip_addresses
+JOIN subnets ON ip_addresses.subnet_id = subnets.subnet_id
+WHERE ipv6address IS NULL`)
+	if err != nil {
+		return fmt.Errorf("Could not query IDs from ip_addresses: %w", err)
+	}
+
+	var allocations []allocation
+	for rows.Next() {
+		var alloc allocation
+		err = rows.Scan(&alloc.id, &alloc.region, &alloc.account, &alloc.subnet)
+		if err != nil {
+			return fmt.Errorf("Could not scan row: %w", err)
+		}
+
+		allocations = append(allocations, alloc)
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		return fmt.Errorf("Cannot commit transaction to get outstanding, unconverted records: %w", err)
+	}
+
+	for _, alloc := range allocations {
+		err = fixAllocation(ctx, db, ec2, alloc)
+		if err != nil {
+			return fmt.Errorf("Could not fix allocation %s: %w", alloc.id, err)
+		}
+	}
+
+	return nil
+}
+
+func fixAllocation(ctx context.Context, db *sql.DB, sessionMgr *ec2wrapper.EC2SessionManager, alloc allocation) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	session, err := sessionMgr.GetSessionFromAccountAndRegion(ctx, ec2wrapper.Key{
+		AccountID: alloc.account,
+		Region:    alloc.region,
+	})
+	if err != nil {
+		return fmt.Errorf("Cannot get session: %w", err)
+	}
+
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{})
+	if err != nil {
+		return errors.Wrap(err, "Could not start database transaction")
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	var ipv4addr string
+	var ipv6addr sql.NullString
+	var staticInterfaceID string
+	row := tx.QueryRowContext(ctx,
+		"SELECT ip_address, ipv6address FROM ip_addresses WHERE id = $1 FOR NO KEY UPDATE",
+		alloc.id,
+	)
+	err = row.Scan(&ipv4addr, &ipv6addr)
+	if err != nil {
+		return fmt.Errorf("Cannot scan ip addresses: %w", err)
+	}
+	v4addr := net.ParseIP(ipv4addr)
+	v6addr := net.ParseIP(ipv6addr.String)
+	if !ipv6addr.Valid {
+		iface, err := getDummyStaticInterface(ctx, session, alloc.subnet)
+		if err != nil {
+			return err
+		}
+
+		staticInterfaceID = aws.StringValue(iface.NetworkInterfaceId)
+		v6addrEni := iface.Ipv6Addresses[0]
+		v6addr = net.ParseIP(aws.StringValue(v6addrEni.Ipv6Address))
+	}
+
+	v6output, err := session.CreateSubnetCidrReservation(ctx, ec2.CreateSubnetCidrReservationInput{
+		Cidr:            aws.String(fmt.Sprintf("%s/128", v6addr.String())),
+		Description:     aws.String(staticReservationDescription),
+		ReservationType: aws.String("explicit"),
+		SubnetId:        aws.String(alloc.subnet),
+	})
+	if err != nil {
+		return fmt.Errorf("Cannot make reservation for IPv6 addr: %w", err)
+	}
+
+	v4output, err := session.CreateSubnetCidrReservation(ctx, ec2.CreateSubnetCidrReservationInput{
+		Cidr:            aws.String(fmt.Sprintf("%s/32", v4addr.String())),
+		Description:     aws.String(staticReservationDescription),
+		ReservationType: aws.String("explicit"),
+		SubnetId:        aws.String(alloc.subnet),
+	})
+	if err != nil {
+		return fmt.Errorf("Cannot make reservation for IPv4 addr: %w", err)
+	}
+
+	_, err = tx.ExecContext(ctx,
+		"INSERT INTO subnet_cidr_reservations_v6(reservation_id, subnet_id, prefix, type, description) VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING ",
+		aws.StringValue(v6output.SubnetCidrReservation.SubnetCidrReservationId),
+		alloc.subnet,
+		aws.StringValue(v6output.SubnetCidrReservation.Cidr),
+		aws.StringValue(v6output.SubnetCidrReservation.ReservationType),
+		aws.StringValue(v6output.SubnetCidrReservation.Description),
+	)
+	if err != nil {
+		return fmt.Errorf("Could not insert subnet CIDR v6 reservation %s: %w", aws.StringValue(v6output.SubnetCidrReservation.SubnetCidrReservationId), err)
+	}
+
+	_, err = tx.ExecContext(ctx,
+		"INSERT INTO subnet_cidr_reservations_v4(reservation_id, subnet_id, prefix, type, description) VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING ",
+		aws.StringValue(v4output.SubnetCidrReservation.SubnetCidrReservationId),
+		alloc.subnet,
+		aws.StringValue(v4output.SubnetCidrReservation.Cidr),
+		aws.StringValue(v4output.SubnetCidrReservation.ReservationType),
+		aws.StringValue(v4output.SubnetCidrReservation.Description),
+	)
+	if err != nil {
+		return fmt.Errorf("Could not insert subnet CIDR v4 reservation %s: %w", aws.StringValue(v4output.SubnetCidrReservation.SubnetCidrReservationId), err)
+	}
+
+	_, err = tx.ExecContext(ctx,
+		"UPDATE ip_addresses SET v4prefix = $1, v6prefix = $2 WHERE id = $3",
+		aws.StringValue(v4output.SubnetCidrReservation.SubnetCidrReservationId),
+		aws.StringValue(v6output.SubnetCidrReservation.SubnetCidrReservationId),
+		alloc.id,
+	)
+	if err != nil {
+		return fmt.Errorf("Could not update prefixes: %w", err)
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		return fmt.Errorf("Could not commit transaction: %w", err)
+	}
+
+	// TODO : delete interface post migration
+	if staticInterfaceID != "" {
+		_, err = session.DeleteNetworkInterface(ctx, ec2.DeleteNetworkInterfaceInput{NetworkInterfaceId: aws.String(staticInterfaceID)})
+		if err != nil {
+			logger.G(ctx).WithError(err).Error("Could not delete titus static dummy interface")
+		}
+	}
+
+	return nil
 }
