@@ -965,7 +965,7 @@ func (r *DockerRuntime) createVolumeContainer(ctx context.Context, containerName
 }
 
 // Prepare host state (pull images, create fs, create container, etc...)
-func (r *DockerRuntime) Prepare(ctx context.Context, pod *v1.Pod) error { // nolint: gocyclo
+func (r *DockerRuntime) Prepare(ctx context.Context, pod *v1.Pod) (err error) { // nolint: gocyclo
 	var volumeContainers []string
 	var sharedMountDirs []string
 
@@ -978,17 +978,20 @@ func (r *DockerRuntime) Prepare(ctx context.Context, pod *v1.Pod) error { // nol
 	logger.G(ctx).WithField("prepareTimeout", r.dockerCfg.prepareTimeout).Info("Preparing container")
 
 	var (
-		containerCreateBody container.ContainerCreateCreatedBody
-		myImageInfo         *types.ImageInspect
-		dockerCfg           *container.Config
-		hostCfg             *container.HostConfig
-		systemServices      []*runtimeTypes.ServiceOpts
-		size                int64
-		runTmpfs            string
-		err                 error
+		myImageInfo *types.ImageInspect
+		imageSize   int64
 	)
 	dockerCreateStartTime := time.Now()
 	group := groupWithContext(ctx)
+
+	defer func() {
+		if err != nil {
+			tracehelpers.SetStatus(err, span)
+			log.Error("Unable to create main container: ", err)
+			r.metrics.Counter("titus.executor.dockerCreateContainerError", 1, nil)
+		}
+	}()
+
 	bindMounts := r.defaultBindMounts
 	totalExtraContainerCount := len(r.c.ExtraUserContainers()) + len(r.c.ExtraPlatformContainers())
 
@@ -996,17 +999,17 @@ func (r *DockerRuntime) Prepare(ctx context.Context, pod *v1.Pod) error { // nol
 	// for *all* of them to share. Otherwise, in the simple case where there is only
 	// one container, the built-in tmpfs of the one container is enough.
 	if len(append(r.c.ExtraPlatformContainers(), r.c.ExtraUserContainers()...)) > 0 {
-		runTmpfs, err = r.createMetatronTmpfs()
+		runTmpfs, err := r.createMetatronTmpfs()
 		r.registerRuntimeCleanup(r.cleanupMetatronTmpfs)
 		if err != nil {
-			goto error
+			return err
 		}
 		bindMounts = append(bindMounts, runTmpfs)
 	}
 
-	systemServices, err = r.c.SystemServices()
+	systemServices, err := r.c.SystemServices()
 	if err != nil {
-		goto error
+		return err
 	}
 
 	group.Go(func(ctx context.Context) error {
@@ -1024,7 +1027,7 @@ func (r *DockerRuntime) Prepare(ctx context.Context, pod *v1.Pod) error { // nol
 			imageInfo = &inspected
 		}
 
-		size = r.reportDockerImageSizeMetric(r.c, imageInfo)
+		imageSize = r.reportDockerImageSizeMetric(r.c, imageInfo)
 		if !r.hasEntrypointOrCmd(imageInfo, r.c) {
 			return NoEntrypointError
 		}
@@ -1127,11 +1130,11 @@ func (r *DockerRuntime) Prepare(ctx context.Context, pod *v1.Pod) error { // nol
 
 	err = group.Wait()
 	if err != nil {
-		goto error
+		return err
 	}
 
 	if err = setSystemdRunning(ctx, *myImageInfo, r.c); err != nil {
-		goto error
+		return err
 	}
 
 	for _, sidecarConfig := range systemServices {
@@ -1144,14 +1147,13 @@ func (r *DockerRuntime) Prepare(ctx context.Context, pod *v1.Pod) error { // nol
 			// probably because if failed to be pulled, potentically indicating that the image doesn't exist,
 			// or a bad deploy, or heck just a typo in the name or something
 			if sidecarConfig.Required {
-				err = fmt.Errorf("Unable to get volume container of required sidecar %s", sidecarConfig.ServiceName)
-				goto error
-			} else {
-				// If the ContainerName is still uninitialized, but this service is not required, then it is
-				// ok to just log about it, but it should not be included on the list of volume containers to use
-				// (because it doesn't exist)
-				logger.G(ctx).Warnf("Skipping volume container of optional sidecar %s", sidecarConfig.ServiceName)
+				return fmt.Errorf("Unable to get volume container of required sidecar %s", sidecarConfig.ServiceName)
 			}
+			// If the ContainerName is still uninitialized, but this service is not required, then it is
+			// ok to just log about it, but it should not be included on the list of volume containers to use
+			// (because it doesn't exist)
+			logger.G(ctx).Warnf("Skipping volume container of optional sidecar %s", sidecarConfig.ServiceName)
+
 		} else {
 			volumeContainers = append(volumeContainers, sidecarConfig.ContainerName)
 		}
@@ -1163,9 +1165,9 @@ func (r *DockerRuntime) Prepare(ctx context.Context, pod *v1.Pod) error { // nol
 		bindMounts = append(bindMounts, getKernelBindMounts()...)
 	}
 
-	dockerCfg, hostCfg, err = r.mainContainerDockerConfig(r.c, bindMounts, size, volumeContainers)
+	dockerCfg, hostCfg, err := r.mainContainerDockerConfig(r.c, bindMounts, imageSize, volumeContainers)
 	if err != nil {
-		goto error
+		return err
 	}
 
 	logger.G(ctx).WithFields(map[string]interface{}{
@@ -1173,7 +1175,7 @@ func (r *DockerRuntime) Prepare(ctx context.Context, pod *v1.Pod) error { // nol
 		"hostCfg":   logger.ShouldJSON(ctx, *hostCfg),
 	}).Info("Creating container in docker")
 
-	containerCreateBody, err = r.client.ContainerCreate(ctx, dockerCfg, hostCfg, nil, r.c.TaskID())
+	containerCreateBody, err := r.client.ContainerCreate(ctx, dockerCfg, hostCfg, nil, r.c.TaskID())
 	r.c.SetID(containerCreateBody.ID)
 
 	r.metrics.Timer("titus.executor.dockerCreateTime", time.Since(dockerCreateStartTime), r.c.ImageTagForMetrics())
@@ -1181,37 +1183,31 @@ func (r *DockerRuntime) Prepare(ctx context.Context, pod *v1.Pod) error { // nol
 		return &runtimeTypes.RegistryImageNotFoundError{Reason: err}
 	}
 	if err != nil {
-		goto error
+		return err
 	}
 	ctx = logger.WithField(ctx, "containerID", r.c.ID())
 	logger.G(ctx).Info("Container successfully created")
 
 	err = r.createTitusEnvironmentFile(r.c)
 	if err != nil {
-		goto error
+		return err
 	}
 	logger.G(ctx).Info("Titus environment file created")
 
 	err = r.createTitusContainerInfoFile(ctx, r.c, r.startTime)
 	if err != nil {
-		goto error
+		return err
 	}
 	logger.G(ctx).Info("Titus cInfo file created")
 
 	sharedMountDirs = getSharedMountDirsFromPod(pod)
 	err = r.pushEnvironment(ctx, r.c, myImageInfo, sharedMountDirs)
 	if err != nil {
-		goto error
+		return err
 	}
 	logger.G(ctx).Info("Titus environment pushed")
 
-error:
-	if err != nil {
-		tracehelpers.SetStatus(err, span)
-		log.Error("Unable to create main container: ", err)
-		r.metrics.Counter("titus.executor.dockerCreateContainerError", 1, nil)
-	}
-	return err
+	return nil
 }
 
 // getSharedMountDirsFromPod takes a pod and looks for special SharedVolumeMounts for the main container.
